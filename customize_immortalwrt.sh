@@ -54,15 +54,55 @@ EOF
 chmod +x $OPENWRT_DIR/files/etc/uci-defaults/99-set-default-wifi-ip
 
 #4. 追加 PassWall / MosDNS 的 feed（补 base 里缺的依赖包）
-grep -q 'passwall_packages' $OPENWRT_DIR/feeds.conf.default || \
-    echo "src-git passwall_packages https://github.com/xiaorouji/openwrt-passwall-packages.git;main" >> $OPENWRT_DIR/feeds.conf.default
-grep -q 'passwall_luci' $OPENWRT_DIR/feeds.conf.default || \
-    echo "src-git passwall_luci https://github.com/xiaorouji/openwrt-passwall.git;main" >> $OPENWRT_DIR/feeds.conf.default
-grep -q 'mosdns' $OPENWRT_DIR/feeds.conf.default || \
-    echo "src-git mosdns https://github.com/sbwml/luci-app-mosdns.git;v5" >> $OPENWRT_DIR/feeds.conf.default
+#
+#   【2026-10 上游迁移】xiaorouji/* 已整体转到 Openwrt-Passwall/* 组织。
+#   旧地址 https://github.com/xiaorouji/openwrt-passwall.git 现在返回 404，
+#   git clone 直接失败 → feeds/passwall_luci 目录压根没被创建 →
+#   后面 ./scripts/feeds install -a 建索引时报
+#     find: 'feeds/passwall_luci': No such file or directory
+#   然后 exit 1，构建停在 "Configuration Customization"（约 19s）。
+#   而 xiaorouji/openwrt-passwall-packages 当时还能 clone，只是因为 GitHub
+#   的重定向记录还在，属于随时会断的运气 —— 所以两个都换成新地址。
+#
+#   另：ImmortalWrt 的 feeds/luci@openwrt-24.10 本身就带 luci-app-passwall，
+#   feeds install 按顺序安装时 base 版会先占位，passwall_luci 这个 feed 实际
+#   只是兜底。但地址失效会让整个构建挂掉，所以必须修对。
+PASSWALL_LUCI_URL="https://github.com/Openwrt-Passwall/openwrt-passwall.git;main"
+PASSWALL_PKGS_URL="https://github.com/Openwrt-Passwall/openwrt-passwall-packages.git;main"
+MOSDNS_URL="https://github.com/sbwml/luci-app-mosdns.git;v5"
+
+#   幂等写法：先删同名旧行再追加。
+#   原来的 `grep -q 名字 || echo 新行` 有个坑：只要文件里存在任意一行含该名字的
+#   配置（哪怕地址早已失效），就不会写入正确的行，错的地址会一直留着。
+set_feed() {
+    _name="$1"; _url="$2"
+    for _conf in "$OPENWRT_DIR/feeds.conf.default" "$OPENWRT_DIR/feeds.conf"; do
+        [ -f "$_conf" ] || continue
+        sed -i "/^[[:space:]]*src-git[[:space:]]\+${_name}[[:space:]]/d" "$_conf"
+        echo "src-git ${_name} ${_url}" >> "$_conf"
+    done
+    echo "    feed: ${_name} -> ${_url}"
+}
+
+set_feed passwall_packages "$PASSWALL_PKGS_URL"
+set_feed passwall_luci     "$PASSWALL_LUCI_URL"
+set_feed mosdns            "$MOSDNS_URL"
 
 cd $OPENWRT_DIR
-./scripts/feeds update -a
+
+#   单个 feed 克隆失败时 scripts/feeds 不会立刻中断，而是拖到建索引阶段才抛出
+#   一个毫无信息量的 find 报错。这里显式校验，报错能直接指到是哪个 feed 挂了。
+./scripts/feeds update -a || echo "WARN: feeds update 返回非 0，继续逐个校验目录"
+
+for _feed in passwall_packages passwall_luci mosdns; do
+    if [ ! -d "feeds/$_feed" ]; then
+        echo "FATAL: feed '$_feed' 没有拉下来（feeds/$_feed 不存在）"
+        echo "       当前配置: $(grep -h "^src-git $_feed " feeds.conf.default feeds.conf 2>/dev/null | head -n1 || true)"
+        echo "       用浏览器打开上面那个 URL（去掉 ;分支 部分）确认仓库/分支是否还在"
+        exit 1
+    fi
+done
+
 ./scripts/feeds install -a
 
 #5. 【关键修复】xray-core 版本对齐（只对 25.12 分支做）
